@@ -23,22 +23,24 @@ import org.apache.spark.sql.types.StructField
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.streaming.Time
 
-import org.apache.spark.Logging
+//import org.apache.spark.Logging
 import org.apache.spark.internal.Logging
 
-import org.apache.spark.ml.Pipeline
-import org.apache.spark.ml.evaluation.RegressionEvaluator
-import org.apache.spark.ml.feature.VectorIndexer
-import org.apache.spark.ml.regression.DecisionTreeRegressor
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.Row
 import org.apache.spark.ml.linalg.Vector
 import org.apache.spark.ml.linalg._
 import org.apache.spark.ml.feature.VectorAssembler
 
+import org.apache.spark.ml.Pipeline
+import org.apache.spark.ml.classification.DecisionTreeClassificationModel
+import org.apache.spark.ml.classification.DecisionTreeClassifier
+import org.apache.spark.ml.evaluation.MulticlassClassificationEvaluator
+import org.apache.spark.ml.feature.{ IndexToString, StringIndexer, VectorIndexer }
 
-object DecisionTreeRegressionModel extends Logging {
-  
+
+object DecisionTreeClassifierModel {
+
   def main(args: Array[String]) {
     // Check that all required args were passed in.
     if (args.length != 6) {
@@ -57,7 +59,7 @@ object DecisionTreeRegressionModel extends Logging {
         """.stripMargin)
       System.exit(1)
     }
-        
+
     // Populate the appropriate variables from the given args
     val Array(appName, streamName, endpointUrl, batchLength, inputDelimiter, models3bucket) = args
 
@@ -88,11 +90,11 @@ object DecisionTreeRegressionModel extends Logging {
     // Get the region name from the endpoint URL to save Kinesis Client Library metadata in
     // DynamoDB of the same region as the Kinesis stream
     val regionName = RegionUtils.getRegionByEndpoint(endpointUrl).getName()
-    
+
     // Setup the SparkConfig and StreamingContext
     val sparkConf = new SparkConf().setAppName(appName)
     val ssc = new StreamingContext(sparkConf, batchInterval)
-        
+
     // Create the Kinesis DStreams
     val kinesisStreams = (0 until numStreams).map { i =>
       KinesisUtils.createStream(ssc, appName, streamName, endpointUrl, regionName,
@@ -103,9 +105,9 @@ object DecisionTreeRegressionModel extends Logging {
     val unionStreams = ssc.union(kinesisStreams)
 
     //define the schema for input data structure
-    val schemaString = "deviceid latitude longitude sensordata datetime"
+    val schemaString = "deviceid latitude longitude sensordata time"
     //Passing the schemaString as a part of the arguments seperated by spaces.
-    
+
     val warehouseLocation = "file:${system:user.dir}/spark-warehouse"
     val spark = SparkSession
       .builder
@@ -113,87 +115,100 @@ object DecisionTreeRegressionModel extends Logging {
       .config("spark.sql.warehouse.dir", warehouseLocation)
       .enableHiveSupport()
       .getOrCreate()
-    
+
     val sqlContext = spark.sqlContext
-        import sqlContext.implicits._
-        import org.apache.spark.sql.functions._
-      
+    import sqlContext.implicits._
+    import org.apache.spark.sql.functions._
+
     val tableSchema = StructType(schemaString.split(" ").map(fieldName => StructField(fieldName, StringType, true)))
-    
-    unionStreams.foreachRDD ((rdd: RDD[Array[Byte]], time: Time) => {
-        if (rdd.take(1).size == 1) 
-        {  
+
+    unionStreams.foreachRDD((rdd: RDD[Array[Byte]], time: Time) => {
+      if (rdd.take(1).size == 1) {
         val rowRDD = rdd.map(w => Row.fromSeq(new String(w).split(inputDelimiter)))
-           
-        val sensorreadingsDF = spark.createDataFrame(rowRDD,tableSchema)
-        
-        val featuresDF = sensorreadingsDF.select($"deviceid",$"latitude",$"longitude",$"datetime",getLabel($"sensordata").as("label"),vectorize($"sensordata").as("feature"))
-     
+
+        val sensorreadingsDF = spark.createDataFrame(rowRDD, tableSchema)
+
+        val featuresDF = sensorreadingsDF.select($"deviceid", $"latitude", $"longitude", $"time", getLabel($"sensordata").as("label"), vectorize($"sensordata", $"latitude", $"longitude", $"time").as("feature"))
+
         trainModel(featuresDF, models3bucket)
-        
-        }
+
+      }
     })
-    
+
     // Start the computation
     ssc.start()
     ssc.awaitTermination()
   }
-  
-  def trainModel(featuresDF: org.apache.spark.sql.DataFrame, models3bucket: String){
-    val assembler = new VectorAssembler()
-          .setInputCols(Array("feature"))
-          .setOutputCol("features")
-    
-        val sampleData = assembler.transform(featuresDF)
-        
-        // Automatically identify categorical features, and index them.
-        // Here, we treat features with > 4 distinct values as continuous.
-        val featureIndexer = new VectorIndexer()
-          .setInputCol("features")
-          .setOutputCol("indexedFeatures")
-          .setMaxCategories(4)
-          .fit(sampleData)
-    
-        // Split the data into training and test sets (30% held out for testing).
-        val Array(trainingData, testData) = sampleData.randomSplit(Array(0.6, 0.4))
-    
-        // Train a DecisionTree model.
-        val dt = new DecisionTreeRegressor()
-          .setLabelCol("label")
-          .setFeaturesCol("indexedFeatures")
-    
-        // Chain indexer and tree in a Pipeline.
-        val pipeline = new Pipeline()
-          .setStages(Array(featureIndexer, dt))
-    
-        // Train model. This also runs the indexer.
-        val model = pipeline.fit(trainingData)
-    
-        // Make predictions.
-        val predictions = model.transform(testData)
-        
-        // Select (prediction, true label) and compute test error.
-        val evaluator = new RegressionEvaluator()
-            .setLabelCol("label")
-            .setPredictionCol("prediction")
-            .setMetricName("rmse")
-        val rmse = evaluator.evaluate(predictions)
-        println("Root Mean Squared Error (RMSE) on test data = " + rmse)
-        
-        model.save(models3bucket)
-        
-        // Select example rows to display.
-        predictions.select("prediction", "label", "features").show()  
-  }
-  
-  import org.apache.spark.sql.functions.udf
-  
-  val getLabel = udf( (sensorData:Int) => sensorData match {
-        case reading if reading < 100 => 0
-        case reading if reading >= 100 && reading < 400 => 1
-        case reading if reading >= 400 && reading < 600 => 2
-        case reading if reading >= 600 => 3
-      }        )
 
-    val vectorize = udf( (s:Double) =>  Vectors.dense(s) )
+  def trainModel(featuresDF: org.apache.spark.sql.DataFrame, models3bucket: String) {
+    val assembler = new VectorAssembler()
+      .setInputCols(Array("feature"))
+      .setOutputCol("features")
+
+    val sampleData = assembler.transform(featuresDF)
+
+    // Index labels, adding metadata to the label column.
+    // Fit on whole dataset to include all labels in index.
+    val labelIndexer = new StringIndexer()
+      .setInputCol("label")
+      .setOutputCol("indexedLabel")
+      .fit(sampleData)
+
+    // Automatically identify categorical features, and index them.
+    // Here, we treat features with > 4 distinct values as continuous.
+    val featureIndexer = new VectorIndexer()
+      .setInputCol("features")
+      .setOutputCol("indexedFeatures")
+      .setMaxCategories(4)
+      .fit(sampleData)
+
+    // Split the data into training and test sets (40% held out for testing).
+    val Array(trainingData, testData) = sampleData.randomSplit(Array(0.6, 0.4))
+
+    // Train a DecisionTree model.
+    val dt = new DecisionTreeClassifier()
+      .setLabelCol("indexedLabel")
+      .setFeaturesCol("indexedFeatures")
+
+    // Convert indexed labels back to original labels.
+    val labelConverter = new IndexToString()
+      .setInputCol("prediction")
+      .setOutputCol("predictedLabel")
+      .setLabels(labelIndexer.labels)
+
+    // Chain indexers and tree in a Pipeline.
+    val pipeline = new Pipeline()
+      .setStages(Array(labelIndexer, featureIndexer, dt, labelConverter))
+
+    // Train model. This also runs the indexer.
+    val model = pipeline.fit(trainingData)
+
+    // Make predictions.
+    val predictions = model.transform(testData)
+
+    // Select (prediction, true label) and compute test error.
+    val evaluator = new MulticlassClassificationEvaluator()
+      .setLabelCol("indexedLabel")
+      .setPredictionCol("prediction")
+      .setMetricName("accuracy")
+    val accuracy = evaluator.evaluate(predictions)
+    
+    println("Test Error = " + (1.0 - accuracy))
+
+    model.save(models3bucket)
+
+    // Select example rows to display.
+    predictions.select("predictedLabel", "label", "features").show()
+  }
+
+  import org.apache.spark.sql.functions.udf
+
+  val getLabel = udf((sensorData: Int) => sensorData match {
+    case reading if reading < 100 => 0
+    case reading if reading >= 100 && reading < 400 => 1
+    case reading if reading >= 400 && reading < 600 => 2
+    case reading if reading >= 600 => 3
+  })
+
+  val vectorize = udf((s: Double, s1: Double, s2: Double, s3: Double) => Vectors.dense(Array[Double](s, s1, s2, s3)))
 }

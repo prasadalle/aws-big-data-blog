@@ -21,7 +21,6 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.types.StringType
 import org.apache.spark.sql.types.StructField
 import org.apache.spark.sql.types.StructType
-import org.apache.spark.sql.functions._
 import org.apache.spark.streaming.Time
 
 //import org.apache.spark.Logging
@@ -31,16 +30,23 @@ import org.apache.spark.ml.Pipeline
 import org.apache.spark.ml.evaluation.RegressionEvaluator
 import org.apache.spark.ml.feature.VectorIndexer
 import org.apache.spark.ml.regression.DecisionTreeRegressor
-import org.apache.spark.ml.PipelineModel
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.Row
 import org.apache.spark.ml.linalg.Vector
 import org.apache.spark.ml.linalg._
 import org.apache.spark.ml.feature.VectorAssembler
-import org.apache.spark.ml.linalg.DenseVector
 
-object AirQualityPredictions {
-  
+
+import org.apache.spark.ml.classification.RandomForestClassifier
+import org.apache.spark.ml.evaluation.MulticlassClassificationEvaluator
+import org.apache.spark.ml.feature.{ IndexToString, StringIndexer, VectorIndexer }
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.Row
+import org.apache.spark.ml.linalg.Vector
+import org.apache.spark.ml.linalg._
+import org.apache.spark.ml.feature.VectorAssembler
+
+object RandomForestClassificationModel {
   def main(args: Array[String]) {
     // Check that all required args were passed in.
     if (args.length != 6) {
@@ -53,15 +59,15 @@ object AirQualityPredictions {
           |    <endpoint-url> is the endpoint of the Kinesis service
           |                   (e.g. https://kinesis.us-east-1.amazonaws.com)
           |    <batch-length-ms> How long is each batch for the temp table view directly from stream in milliseconds
-          |    <input-Delimiter> Delimiter? - how to split the data in each row of the stream to generate fields i.e ","
-          |    <model-s3bucket>  Name of the s3 bucket where you have stored your model from Model generate program 
+          |    <inputDelimiter> Delimiter? - how to split the data in each row of the stream to generate fields i.e ","
+          |    <models3bucket> Name of the s3 bucket where you store your model           
           |     
         """.stripMargin)
       System.exit(1)
     }
-        
+
     // Populate the appropriate variables from the given args
-    val Array(appName, streamName, endpointUrl, batchLength, inputDelimiter, models3bucket ) = args
+    val Array(appName, streamName, endpointUrl, batchLength, inputDelimiter, models3bucket) = args
 
     // Determine the number of shards from the stream using the low-level Kinesis Client
     // from the AWS Java SDK.
@@ -89,13 +95,12 @@ object AirQualityPredictions {
 
     // Get the region name from the endpoint URL to save Kinesis Client Library metadata in
     // DynamoDB of the same region as the Kinesis stream
-    
-    val regionName = RegionUtils.getRegionByEndpoint(endpointUrl).getName
-    
+    val regionName = RegionUtils.getRegionByEndpoint(endpointUrl).getName()
+
     // Setup the SparkConfig and StreamingContext
     val sparkConf = new SparkConf().setAppName(appName)
     val ssc = new StreamingContext(sparkConf, batchInterval)
-        
+
     // Create the Kinesis DStreams
     val kinesisStreams = (0 until numStreams).map { i =>
       KinesisUtils.createStream(ssc, appName, streamName, endpointUrl, regionName,
@@ -106,9 +111,9 @@ object AirQualityPredictions {
     val unionStreams = ssc.union(kinesisStreams)
 
     //define the schema for input data structure
-    val schemaString = "deviceid latitude longitude sensorreading time"
+    val schemaString = "deviceid latitude longitude sensordata time"
     //Passing the schemaString as a part of the arguments seperated by spaces.
-    
+
     val warehouseLocation = "file:${system:user.dir}/spark-warehouse"
     val spark = SparkSession
       .builder
@@ -116,58 +121,102 @@ object AirQualityPredictions {
       .config("spark.sql.warehouse.dir", warehouseLocation)
       .enableHiveSupport()
       .getOrCreate()
-    
-    val sqlContext = spark.sqlContext
-        import sqlContext.implicits._ 
-        import org.apache.spark.sql.functions._ 
-      
-    val tableSchema = StructType(schemaString.split(" ").map(fieldName => StructField(fieldName, StringType, true)))
-    
-    // Drop the tables if it already exists 
-    spark.sql("DROP TABLE IF EXISTS tbl_airqualityPredictions")
-   
-    // Create the tables to store your streams 
-    spark.sql("CREATE TABLE tbl_airqualityPredictions(deviceid string,latitude string,longitude string,time string,sensorreading string,prediction string,airqualityprediction string) STORED AS TEXTFILE")
-    
-    unionStreams.foreachRDD ((rdd: RDD[Array[Byte]], time: Time) => {
 
+    val sqlContext = spark.sqlContext
+    import sqlContext.implicits._
+    import org.apache.spark.sql.functions._
+
+    val tableSchema = StructType(schemaString.split(" ").map(fieldName => StructField(fieldName, StringType, true)))
+
+    unionStreams.foreachRDD((rdd: RDD[Array[Byte]], time: Time) => {
+      if (rdd.take(1).size == 1) {
         val rowRDD = rdd.map(w => Row.fromSeq(new String(w).split(inputDelimiter)))
-           
-        val sensorreadingsDF = spark.createDataFrame(rowRDD,tableSchema)
-        
-        val featuresDF = sensorreadingsDF.select($"deviceid",$"latitude",$"longitude",$"time",vectorize($"sensorreading",$"latitude",$"longitude",$"time").as("features"))
-        
-        val PIPELINE_MODEL: String = models3bucket
-          
-        val model: PipelineModel = PipelineModel.load(PIPELINE_MODEL)
-        
-        val airqualityresultsDF = model.transform(featuresDF)
-            
-        val lblairqualityresultsDF = airqualityresultsDF.withColumn("AirQuality", getText($"predictedLabel"))
-        
-        val vectorToColumn = udf{ (x:DenseVector, index: Int) => x(index) }
-    
-        val finalresultsDF = lblairqualityresultsDF.withColumn("SensorReading",vectorToColumn(col("features"),lit(0)))
-    
-        finalresultsDF.createOrReplaceTempView("airqualityTempTable")
-        
-        //Insert continuous streams predictions into hive table
-        spark.sql("insert into table tbl_airqualityPredictions select deviceid,latitude,longitude,time,SensorReading,predictedLabel,AirQuality from airqualityTempTable")
-        
-        // select the parsed messages from table using SQL and print it (since it runs on drive display few records)
-        val sqllblairqualityresultsDF = spark.sql("select * from airqualityTempTable")
-        println(s"========= $time =========")
-        sqllblairqualityresultsDF.show()
-      
+
+        val sensorreadingsDF = spark.createDataFrame(rowRDD, tableSchema)
+
+        val featuresDF = sensorreadingsDF.select($"deviceid", $"latitude", $"longitude", $"time", getLabel($"sensordata").as("label"), vectorize($"sensordata",$"latitude",$"longitude",$"time").as("feature"))
+
+        trainModel(featuresDF, models3bucket)
+
+      }
     })
-    
+
     // Start the computation
     ssc.start()
     ssc.awaitTermination()
-  
   }
-  
+
+  def trainModel(featuresDF: org.apache.spark.sql.DataFrame, models3bucket: String) {
+    val assembler = new VectorAssembler()
+      .setInputCols(Array("feature"))
+      .setOutputCol("features")
+
+    val sampleData = assembler.transform(featuresDF)
+
+    // Index labels, adding metadata to the label column.
+    // Fit on whole dataset to include all labels in index.
+    val labelIndexer = new StringIndexer()
+      .setInputCol("label")
+      .setOutputCol("indexedLabel")
+      .fit(sampleData)
+
+    // Automatically identify categorical features, and index them.
+    // Here, we treat features with > 4 distinct values as continuous.
+    val featureIndexer = new VectorIndexer()
+      .setInputCol("features")
+      .setOutputCol("indexedFeatures")
+      .setMaxCategories(4)
+      .fit(sampleData)
+
+    // Split the data into training and test sets (40% held out for testing).
+    val Array(trainingData, testData) = sampleData.randomSplit(Array(0.6, 0.4))
+
+    // Train a RandomForest model.
+    val rf = new RandomForestClassifier()
+      .setLabelCol("indexedLabel")
+      .setFeaturesCol("indexedFeatures")
+      .setNumTrees(10)
+
+    // Convert indexed labels back to original labels.
+    val labelConverter = new IndexToString()
+      .setInputCol("prediction")
+      .setOutputCol("predictedLabel")
+      .setLabels(labelIndexer.labels)
+
+    // Chain indexers and forest in a Pipeline.
+    val pipeline = new Pipeline()
+      .setStages(Array(labelIndexer, featureIndexer, rf, labelConverter))
+
+    // Train model. This also runs the indexers.
+    val model = pipeline.fit(trainingData)
+
+    // Make predictions.
+    val predictions = model.transform(testData)
+
+    // Select (prediction, true label) and compute test error.
+    val evaluator = new MulticlassClassificationEvaluator()
+      .setLabelCol("indexedLabel")
+      .setPredictionCol("prediction")
+      .setMetricName("accuracy")
+
+    val accuracy = evaluator.evaluate(predictions)
+
+    println("Accuracy on test data = " + accuracy)
+
+    model.save(models3bucket)
+
+    // Select example rows to display.
+    predictions.select("predictedLabel", "label", "features").show(5)
+  }
+
   import org.apache.spark.sql.functions.udf
+
+  val getLabel = udf((sensorData: Int) => sensorData match {
+    case reading if reading < 100 => 0
+    case reading if reading >= 100 && reading < 400 => 1
+    case reading if reading >= 400 && reading < 600 => 2
+    case reading if reading >= 600 => 3
+  })
+
   val vectorize = udf( (s:Double, s1:Double, s2:Double, s3:Double) => Vectors.dense(Array[Double](s, s1, s2, s3)) )
-  val getText = udf( (value: Int) => AirQualityType.fromPrediction(value) )
 }
